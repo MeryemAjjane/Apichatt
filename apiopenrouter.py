@@ -1,70 +1,44 @@
-# import pdfplumber
-# from fastapi import FastAPI, UploadFile, File
-# import requests
-# import json
-
-# app = FastAPI()
-
-# OPENROUTER_API_KEY = "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"
-
-# @app.post("/extract-backlogs/")
-# async def extract_backlogs(file: UploadFile = File(...)):
-#     with pdfplumber.open(file.file) as pdf:
-#         text = ""
-#         for page in pdf.pages[:5]:  # Limiter à 10 pages maximum pour éviter l'excès de texte
-#             text += page.extract_text() or ""
-
-#     # Limiter le texte à environ 10 000 caractères (environ 2000 tokens)
-#     if len(text) > 10000:
-#         text = text[:10000]  # Limite de 10 000 caractères
-
-#     # Envoyer le texte extrait à OpenRouter
-#     response = requests.post(
-#         url="https://openrouter.ai/api/v1/chat/completions",
-#         headers={
-#             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-#             "Content-Type": "application/json"
-#         },
-#         data=json.dumps({
-#             "model": "shisa-ai/shisa-v2-llama3.3-70b:free",
-#             "messages": [
-#                 {
-#                     "role": "user",
-#                     "content": text
-#                 }
-#             ],
-#         })
-#     )
-
-#     # Vérifier la réponse
-#     if response.status_code == 200:
-#         return response.json()
-#     else:
-#         return {"error": "Échec de la connexion à OpenRouter", "details": response.text}
-
+    
+import re
+import json
 from fastapi import FastAPI, File, UploadFile
 import pdfplumber
-import json
-import httpx  # Pour faire des requêtes HTTP asynchrones
+import httpx
 
 app = FastAPI()
 
-OPENROUTER_API_KEY = "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"  # Remplace par ta clé OpenRouter
+OPENROUTER_API_KEY = "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"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/completions"
+
+def extract_json(text):
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                json_str = text[start:i+1]
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 @app.post("/extract-backlogs/")
 async def extract_backlogs(file: UploadFile = File(...)):
     try:
-        # Lire le fichier PDF
         with pdfplumber.open(file.file) as pdf:
-            text = ""
-            for page in pdf.pages:
-                text += page.extract_text()
+            text = "".join(page.extract_text() or "" for page in pdf.pages)
+        text = text[:2000]  # Limiter à 2000 caractères pour meilleure compréhension
 
-        # Limiter le texte pour éviter les problèmes de longueur
-        text = text[:4000]  # Limite à 4000 caractères (modifiable)
-        
-        # Le prompt pour OpenRouter
+        # Forcer l'extraction du titre (1ère ligne)
+        lines = text.splitlines()
+        title = lines[0].strip() if lines else "Titre du projet"
         prompt = f"""
         Voici un texte extrait d'un cahier de charges : {text}. 
         Analyse ce texte et :
@@ -80,7 +54,7 @@ async def extract_backlogs(file: UploadFile = File(...)):
         }}
         """
 
-        # Envoyer le prompt à OpenRouter
+
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 OPENROUTER_API_URL,
@@ -89,26 +63,48 @@ async def extract_backlogs(file: UploadFile = File(...)):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "shisa-ai/shisa-v2-llama3.3-70b:free",  # Utilise le modèle de ton choix
+                    "model": "qwen/qwen3-0.6b-04-28:free",
                     "prompt": prompt,
                     "max_tokens": 800,
-                    "temperature": 0.7
+                    "temperature": 0.5
                 }
             )
 
-        # Afficher la réponse pour le débogage
-        print("Réponse OpenRouter:", response.text)
-
-        # Vérifier la réponse de OpenRouter
-        if response.status_code == 200:
-            result = response.json()
-            generated_text = result.get("choices")[0].get("text", "").strip()
-            return json.loads(generated_text)  # Retourner directement la réponse JSON générée par OpenRouter
-
-        else:
+        if response.status_code != 200:
             return {"error": f"Erreur OpenRouter: {response.text}"}
 
-    except json.JSONDecodeError:
-        return {"error": "La réponse de OpenRouter n'est pas un JSON valide."}
+        result = response.json()
+        generated_text = result.get("choices", [{}])[0].get("text", "").strip()
+
+        print("Texte généré :", repr(generated_text))
+
+        # Nettoyer la réponse pour enlever tout avant le premier {
+        index_first_brace = generated_text.find('{')
+        if index_first_brace != -1:
+            cleaned_text = generated_text[index_first_brace:]
+        else:
+            cleaned_text = generated_text
+
+        response_json = extract_json(cleaned_text)
+
+        if response_json is None:
+            return {
+                "error": "Le modèle n'a pas généré un JSON valide.",
+                "generated_text": generated_text
+            }
+
+        # Si le JSON n'a pas de backlogs, extraire les backlogs manuellement
+        if not response_json.get("backlogs"):
+            response_json["title"] = title
+            response_json["backlogs"] = []
+            for line in lines:
+                if "objectif" in line.lower() or "but" in line.lower() or "tâche" in line.lower():
+                    response_json["backlogs"].append({
+                        "title": line.strip(),
+                        "description": "Description détectée automatiquement."
+                    })
+
+        return response_json
+
     except Exception as e:
         return {"error": str(e)}
